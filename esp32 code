@@ -1,0 +1,301 @@
+/* Integrated sketch with MG90S servos (pins 4 & 6)
+   PCA9685 (pins 0,2 for site servos, 4,6 for MG90S)
+   OLED on Wire1 (SDA=21, SCL=22)
+   MPU6050 via software I2C (SDA=23, SCL=5)
+*/
+
+// ---------- Libraries ----------
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include "DHT.h"
+#include <math.h>
+
+// ---------- Wi-Fi / Server ----------
+const char* ssid = "You_wifi";
+const char* password = "wifi_pass";
+const char* serverUrl = "http://192.168.0.58/smart_factory/insert_data.php";
+
+// ---------- Pins ----------
+const int ledPin = 2;
+const int mq2PinSite1 = 34;
+const int mq2PinSite2 = 35;
+#define DHTPIN1 26
+#define DHTPIN2 27
+#define DHTTYPE DHT11
+DHT dht1(DHTPIN1, DHTTYPE);
+DHT dht2(DHTPIN2, DHTTYPE);
+
+const int FAN1_PIN = 32;
+const int FAN2_PIN = 33;
+const int RELAY_ACTIVE = LOW;
+const int RELAY_INACTIVE = HIGH;
+
+// ---------- Thresholds ----------
+const int GAS_THRESHOLD = 2000;
+const float TEMP_THRESHOLD = 30.0;
+const float MPU_THRESHOLD_G = 3.0; // 3 g threshold
+
+// ---------- MPU Calibration Offsets ----------
+const int AX_OFFSET = -322;
+const int AY_OFFSET = -316;
+const int AZ_OFFSET = -1663;
+
+// ---------- Timing ----------
+const unsigned long SHAKE_TIME_REQUIRED = 2000; // 2 sec shaking
+const unsigned long ALERT_HOLD_TIME = 3000;     // 3 sec hold
+bool wifiConnected = false;
+unsigned long previousSendTime = 0;
+const long sendInterval = 1000; // 1 second
+
+// ---------- PCA9685 / Servo ----------
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40, Wire);
+const int SERVOMIN = 150;
+const int SERVOMAX = 600;
+const int PWM_FREQ = 50;
+const uint8_t SITE1_CHANNEL = 0;
+const uint8_t SITE2_CHANNEL = 2;
+const int SITE1_NORMAL_ANGLE = 90;
+const int SITE1_ALARM_ANGLE  = 0;
+const int SITE2_NORMAL_ANGLE = 0;
+const int SITE2_ALARM_ANGLE  = 90;
+
+// ---------- MG90S Servos ----------
+const uint8_t MG_SERVO1_CHANNEL = 4;
+const uint8_t MG_SERVO2_CHANNEL = 6;
+const int MG_SERVO_NORMAL_ANGLE = 0;
+const int MG_SERVO_ALERT_ANGLE = 45;
+bool mgServoActive = false;
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire1, -1); 
+const uint8_t OLED_ADDR = 0x3C;
+
+// ---------- MPU6050 Software I2C ----------
+const uint8_t MPU_I2C_ADDR = 0x68;
+const uint8_t SW_SDA = 23;
+const uint8_t SW_SCL = 5;
+const unsigned int I2C_DELAY_US = 5;
+
+// ---------- State trackers ----------
+bool fan1State = false;
+bool fan2State = false;
+bool servo1Moved = false;
+bool servo2Moved = false;
+
+// Earthquake detection
+unsigned long shakeStartTime = 0;
+unsigned long alertStartTime = 0;
+bool shaking = false;
+bool earthquakeActive = false;
+
+// ----------------- Software I2C Routines -----------------
+inline void sda_low()  { pinMode(SW_SDA, OUTPUT); digitalWrite(SW_SDA, LOW); }
+inline void sda_high() { pinMode(SW_SDA, INPUT_PULLUP); }
+inline int sda_read()  { pinMode(SW_SDA, INPUT_PULLUP); return digitalRead(SW_SDA); }
+inline void scl_low()  { pinMode(SW_SCL, OUTPUT); digitalWrite(SW_SCL, LOW); }
+inline void scl_high() { pinMode(SW_SCL, INPUT_PULLUP); }
+inline void scl_pulse() { scl_high(); delayMicroseconds(I2C_DELAY_US); scl_low(); delayMicroseconds(I2C_DELAY_US); }
+
+void swI2CStart() { sda_high(); scl_high(); delayMicroseconds(I2C_DELAY_US); sda_low(); delayMicroseconds(I2C_DELAY_US); scl_low(); }
+void swI2CStop() { sda_low(); delayMicroseconds(I2C_DELAY_US); scl_high(); delayMicroseconds(I2C_DELAY_US); sda_high(); delayMicroseconds(I2C_DELAY_US); }
+
+bool swI2CWriteByte(uint8_t data){
+  for(int i=7;i>=0;i--){
+    if(data & (1<<i)) sda_high(); else sda_low();
+    delayMicroseconds(I2C_DELAY_US); scl_high(); delayMicroseconds(I2C_DELAY_US); scl_low(); delayMicroseconds(I2C_DELAY_US);
+  }
+  sda_high(); delayMicroseconds(I2C_DELAY_US);
+  scl_high(); delayMicroseconds(I2C_DELAY_US);
+  int ack = sda_read();
+  scl_low(); delayMicroseconds(I2C_DELAY_US);
+  return (ack == 0);
+}
+
+uint8_t swI2CReadByte(bool ack){
+  uint8_t val=0; sda_high();
+  for(int i=7;i>=0;i--){
+    delayMicroseconds(I2C_DELAY_US); scl_high(); delayMicroseconds(I2C_DELAY_US);
+    if(sda_read()) val |= (1<<i);
+    scl_low(); delayMicroseconds(I2C_DELAY_US);
+  }
+  if(ack) sda_low(); else sda_high();
+  delayMicroseconds(I2C_DELAY_US);
+  scl_high(); delayMicroseconds(I2C_DELAY_US);
+  scl_low(); sda_high(); delayMicroseconds(I2C_DELAY_US);
+  return val;
+}
+
+bool swI2CWriteRegister(uint8_t deviceAddr,uint8_t reg,uint8_t value){
+  swI2CStart();
+  if(!swI2CWriteByte((deviceAddr<<1)|0)){ swI2CStop(); return false; }
+  if(!swI2CWriteByte(reg)){ swI2CStop(); return false; }
+  if(!swI2CWriteByte(value)){ swI2CStop(); return false; }
+  swI2CStop(); return true;
+}
+
+bool swI2CReadRegisters(uint8_t deviceAddr,uint8_t reg,uint8_t* buf,size_t len){
+  swI2CStart();
+  if(!swI2CWriteByte((deviceAddr<<1)|0)){ swI2CStop(); return false; }
+  if(!swI2CWriteByte(reg)){ swI2CStop(); return false; }
+  swI2CStart();
+  if(!swI2CWriteByte((deviceAddr<<1)|1)){ swI2CStop(); return false; }
+  for(size_t i=0;i<len;i++){ buf[i]=swI2CReadByte(i<(len-1)); }
+  swI2CStop(); return true;
+}
+
+float readMPU6050MagnitudeG(){
+  uint8_t data[6]={0};
+  if(!swI2CReadRegisters(MPU_I2C_ADDR,0x3B,data,6)){
+    Serial.println("MPU Read Fail"); return 0.0;
+  }
+  int16_t ax=(int16_t)((data[0]<<8)|data[1]);
+  int16_t ay=(int16_t)((data[2]<<8)|data[3]);
+  int16_t az=(int16_t)((data[4]<<8)|data[5]);
+  ax -= AX_OFFSET; ay -= AY_OFFSET; az -= AZ_OFFSET;
+  float gx=(float)ax/16384.0, gy=(float)ay/16384.0, gz=(float)az/16384.0;
+  return sqrt(gx*gx + gy*gy + gz*gz);
+}
+
+// ----------------- Setup -----------------
+void setup(){
+  Serial.begin(115200);
+  pinMode(ledPin,OUTPUT);
+  pinMode(mq2PinSite1,INPUT); pinMode(mq2PinSite2,INPUT);
+  pinMode(FAN1_PIN,OUTPUT); pinMode(FAN2_PIN,OUTPUT);
+  digitalWrite(FAN1_PIN,RELAY_INACTIVE); digitalWrite(FAN2_PIN,RELAY_INACTIVE);
+  dht1.begin(); dht2.begin();
+
+  Wire.begin(18,19,400000); pwm.begin(); pwm.setPWMFreq(PWM_FREQ);
+  Wire1.begin(21,22,400000);
+  if(!display.begin(SSD1306_SWITCHCAPVCC,OLED_ADDR)){ Serial.println("SSD1306 failed"); }
+  else { display.clearDisplay(); display.setTextColor(SSD1306_WHITE); display.setTextSize(2); display.setCursor(0,20); display.println("WELCOME"); display.display(); }
+
+  pinMode(SW_SDA,INPUT_PULLUP); pinMode(SW_SCL,INPUT_PULLUP);
+  swI2CWriteRegister(MPU_I2C_ADDR,0x6B,0x00); // wake MPU
+
+  setServoAngle(SITE1_CHANNEL,SITE1_NORMAL_ANGLE);
+  setServoAngle(SITE2_CHANNEL,SITE2_NORMAL_ANGLE);
+  setServoAngle(MG_SERVO1_CHANNEL,MG_SERVO_NORMAL_ANGLE);
+  setServoAngle(MG_SERVO2_CHANNEL,MG_SERVO_NORMAL_ANGLE);
+
+  WiFi.begin(ssid,password); Serial.println("Connecting to WiFi...");
+}
+
+// ----------------- Main Loop -----------------
+void loop(){
+  unsigned long currentMillis=millis();
+
+  if(WiFi.status()==WL_CONNECTED){ 
+    if(!wifiConnected){ Serial.println("WiFi Connected!"); wifiConnected=true; } 
+    digitalWrite(ledPin,HIGH);
+  } else { if(wifiConnected){ Serial.println("WiFi Disconnected!"); wifiConnected=false; } digitalWrite(ledPin,LOW); return; }
+
+  if(currentMillis-previousSendTime>=sendInterval){
+    previousSendTime=currentMillis;
+
+    float mpu_g = readMPU6050MagnitudeG();
+
+    // Earthquake logic
+    if(earthquakeActive){
+      if(millis()-alertStartTime>=ALERT_HOLD_TIME){ earthquakeActive=false; shaking=false; shakeStartTime=0; Serial.println("Earthquake alert cleared"); }
+      else{ Serial.print("EARTHQUAKE ACTIVE - mpu_g="); Serial.println(mpu_g,3); }
+    } else {
+      if(mpu_g>=MPU_THRESHOLD_G){
+        if(!shaking){ shaking=true; shakeStartTime=millis(); Serial.println("Shaking started"); }
+        else if(millis()-shakeStartTime>=SHAKE_TIME_REQUIRED){ earthquakeActive=true; alertStartTime=millis(); Serial.print("🚨 EARTHQUAKE! magnitude="); Serial.println(mpu_g,3); }
+      } else { if(shaking) Serial.println("Shaking reset"); shaking=false; shakeStartTime=0; }
+    }
+
+    // --- Site 1 & 2 readings & logic ---
+    int gas1=analogRead(mq2PinSite1); float temp1=dht1.readTemperature(); float hum1=dht1.readHumidity();
+    int gas2=analogRead(mq2PinSite2); float temp2=dht2.readTemperature(); float hum2=dht2.readHumidity();
+    bool gas1High=(gas1>GAS_THRESHOLD), temp1High=(!isnan(temp1)&&(temp1>TEMP_THRESHOLD)), desiredFan1=gas1High||temp1High;
+    bool gas2High=(gas2>GAS_THRESHOLD), temp2High=(!isnan(temp2)&&(temp2>TEMP_THRESHOLD)), desiredFan2=gas2High||temp2High;
+
+    if(desiredFan1!=fan1State){ fan1State=desiredFan1; digitalWrite(FAN1_PIN,fan1State?RELAY_ACTIVE:RELAY_INACTIVE); Serial.println(fan1State?"Site1 Fan ON":"Site1 Fan OFF"); }
+    if(desiredFan2!=fan2State){ fan2State=desiredFan2; digitalWrite(FAN2_PIN,fan2State?RELAY_ACTIVE:RELAY_INACTIVE); Serial.println(fan2State?"Site2 Fan ON":"Site2 Fan OFF"); }
+
+    if(desiredFan1&&!servo1Moved){ setServoAngle(SITE1_CHANNEL,SITE1_ALARM_ANGLE); servo1Moved=true; Serial.println("Site1 Servo ALARM"); }
+    else if(!desiredFan1&&servo1Moved){ setServoAngle(SITE1_CHANNEL,SITE1_NORMAL_ANGLE); servo1Moved=false; Serial.println("Site1 Servo NORMAL"); }
+
+    if(desiredFan2&&!servo2Moved){ setServoAngle(SITE2_CHANNEL,SITE2_ALARM_ANGLE); servo2Moved=true; Serial.println("Site2 Servo ALARM"); }
+    else if(!desiredFan2&&servo2Moved){ setServoAngle(SITE2_CHANNEL,SITE2_NORMAL_ANGLE); servo2Moved=false; Serial.println("Site2 Servo NORMAL"); }
+
+    // MG90S servo gas alert
+    if((gas1High||gas2High)&&!mgServoActive){ 
+      mgServoActive=true;
+      Serial.println("Gas alert! MG90S 45°"); 
+      setServoAngle(MG_SERVO1_CHANNEL,MG_SERVO_ALERT_ANGLE); setServoAngle(MG_SERVO2_CHANNEL,MG_SERVO_ALERT_ANGLE); delay(3000);
+      setServoAngle(MG_SERVO1_CHANNEL,MG_SERVO_NORMAL_ANGLE); setServoAngle(MG_SERVO2_CHANNEL,MG_SERVO_NORMAL_ANGLE); mgServoActive=false;
+      Serial.println("MG90S servos back 0°");
+    }
+
+    updateOLED(desiredFan1,desiredFan2,earthquakeActive);
+    sendData(1,gas1,gas1High?"HIGH":"LOW",temp1,temp1High?"HIGH":"NORMAL",hum1,fan1State?"ON":"OFF",mpu_g);
+    sendData(2,gas2,gas2High?"HIGH":"LOW",temp2,temp2High?"HIGH":"NORMAL",hum2,fan2State?"ON":"OFF",mpu_g);
+  }
+}
+
+// ----------------- Servo Helper -----------------
+void setServoAngle(uint8_t channel,int angle){ if(angle<0) angle=0; if(angle>180) angle=180; int pulse=map(angle,0,180,SERVOMIN,SERVOMAX); pwm.setPWM(channel,0,pulse); delay(200); }
+
+// ----------------- URL Encode -----------------
+// ----------------- URL Encode -----------------
+String urlEncode(String str) {
+  String encoded = "";
+  char c, code0, code1;
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encoded += c;
+    } else {
+      encoded += '%';
+      code0 = (c >> 4) & 0xF;
+      code1 = c & 0xF;
+      // Append as chars, no String/char mismatch
+      encoded += (code0 < 10) ? char('0' + code0) : char('A' + code0 - 10);
+      encoded += (code1 < 10) ? char('0' + code1) : char('A' + code1 - 10);
+    }
+  }
+  return encoded;
+}
+
+// ----------------- Send Data -----------------
+void sendData(int site,int gas,String gasStatus,float temp,String tempStatus,float hum,String fan,float mpu_value){
+  if(WiFi.status()==WL_CONNECTED){
+    HTTPClient http; http.begin(serverUrl); http.addHeader("Content-Type","application/x-www-form-urlencoded");
+    String tempStr=isnan(temp)?String(-999.0):String(temp);
+    String humStr=isnan(hum)?String(-999.0):String(hum);
+    String mpuStr=String(mpu_value,3);
+    String postData="site_id="+String(site);
+    postData+="&gas_value="+String(gas);
+    postData+="&gas_status="+urlEncode(gasStatus);
+    postData+="&temperature="+tempStr;
+    postData+="&temp_status="+urlEncode(tempStatus);
+    postData+="&humidity="+humStr;
+    postData+="&mpu_value="+mpuStr;
+    postData+="&fan_status="+urlEncode(fan);
+    Serial.println("POST: "+postData);
+    int code=http.POST(postData);
+    if(code>0) Serial.println("Site "+String(site)+" Response: "+http.getString()); else Serial.println("Error sending Site "+String(site));
+    http.end();
+  }
+}
+
+// ----------------- OLED -----------------
+void updateOLED(bool site1Problem,bool site2Problem,bool quake){
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  if(quake){ display.setTextSize(2); display.setCursor(10,10); display.println("EARTHQUAKE!"); display.setTextSize(1); display.setCursor(0,40); display.println("Demo hold active"); display.display(); return; }
+  display.setTextSize(1);
+  if(!site1Problem && !site2Problem){ display.setTextSize(2); display.setCursor(10,20); display.println("WELCOME"); }
+  else if(site1Problem && site2Problem){ display.setTextSize(2); display.setCursor(0,10); display.println("SITE1 & 2"); display.setTextSize(1); display.setCursor(0,40); display.println("PROBLEM"); }
+  else if(site1Problem){ display.setTextSize(2); display.setCursor(0,20); display.println("SITE1"); display.setTextSize(1); display.setCursor(0,45); display.println("PROBLEM"); }
+  else if(site2Problem){ display.setTextSize(2); display.setCursor(0,20); display.println("SITE2"); display.setTextSize(1); display.setCursor(0,45); display.println("PROBLEM"); }
+  display.display();
+}
